@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.1.11304.174 d18.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Blockchain_vaja", "Blockchain_vaja\Blockchain_vaja.csproj", "{2A3012DA-8BCE-46AE-BE35-92CED58FE07B}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{2A3012DA-8BCE-46AE-BE35-92CED58FE07B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2A3012DA-8BCE-46AE-BE35-92CED58FE07B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2A3012DA-8BCE-46AE-BE35-92CED58FE07B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2A3012DA-8BCE-46AE-BE35-92CED58FE07B}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {58D8168B-E279-43BC-93EE-58E0642C91DB}
+	EndGlobalSection
+EndGlobal
