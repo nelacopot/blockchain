@@ -18,6 +18,7 @@ namespace Blockchain_vaja
     {
         private TcpListener server; //ker imam P2P omrežje
         private List<TcpClient> peers = new List<TcpClient>(); //seznam vseh peer povezav
+        private readonly object chainLock = new object();
         private string username; //ne uporablja se za transakcije, samo za UI zapis
         private int serverPort; //port na katerem server posluša
         private CancellationTokenSource serverCancellationTokenSource; //mehanizmi za zaustavitev asinhronih zank
@@ -98,59 +99,68 @@ namespace Blockchain_vaja
 
         private async Task HandleClient(TcpClient client, CancellationToken token) //funkcija, ki prejema podatke
         {
-            NetworkStream netstr = client.GetStream(); // RECEIVE je tu
-            byte[] buffer = new byte[102400];
+            using var stream = client.GetStream(); // RECEIVE je tu
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+
 
             while (!token.IsCancellationRequested)
             {
-                try
+                var line = await reader.ReadLineAsync();
+                if (line == null)
+                    break;
+
+                string msg = line.Trim();
+                if (msg.StartsWith("[") && msg.EndsWith("]"))
                 {
-                    int bytesRead = await netstr.ReadAsync(buffer, 0, buffer.Length, token);
-                    if (bytesRead > 0)
+                    try
                     {
-                        string msg = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                        var receivedChain = JsonSerializer.Deserialize<List<Block>>(msg);
 
-                        if (msg.StartsWith("[") && msg.EndsWith("]")) //prepoznava JSON
+                        bool replaced = false;
+                        if (receivedChain != null)
                         {
-
-                            await Task.Run(async () =>
+                            lock (chainLock)
                             {
-                                try
-                                {
-                                    List<Block> receivedChain = JsonSerializer.Deserialize<List<Block>>(msg);
+                                replaced = blockchain.ReplaceChain(receivedChain);
+                            }
 
-                                    if (blockchain.ReplaceChain(receivedChain)) //če veriga boljša po pravilih konsenza...
-                                    {
-                                        UpdateMessages("Replaced chain with longer received chain.");
-                                    }
+                            if (replaced)
+                            {
+                                UpdateMessages("Replaced chain with better received chain.");
 
-                                    var lastBlock = receivedChain.Last();
-                                    UpdateMessages($"index: {lastBlock.Index}");
-                                    UpdateMessages($"diff: {lastBlock.Difficulty}");
-                                    UpdateMessages($"hash: {lastBlock.Hash}");
-                                    UpdateMessages($"previous hash: {lastBlock.PreviousHash}");
-                                    UpdateHashes(lastBlock.Hash);
-                                }
-                                catch (Exception ex)
+                                Block lastBlock;
+                                lock (chainLock)
                                 {
-                                    UpdateMessages($"Error deserializing chain: {ex.Message}");
+                                    lastBlock = blockchain.GetLatestBlock();
                                 }
-                            });
+
+                                DisplayValidBlock(lastBlock);
+
+                                //ustavi trenutni mining loop in ga ponovno zaženi
+                                miningCancellationTokenSource?.Cancel();
+                                miningCancellationTokenSource = new CancellationTokenSource();
+                                Task.Run(() => Mining(miningCancellationTokenSource.Token));
+                            }
                         }
-                        else
+
+                        var last = receivedChain?.LastOrDefault();
+                        if (last != null)
                         {
-                            UpdateMessages($"Received: {msg}");
+                            //UpdateMessages($"index: {last.Index}");
+                            //UpdateMessages($"diff: {last.Difficulty}");
+                            //UpdateMessages($"hash: {last.Hash}");
+                            //UpdateMessages($"previous hash: {last.PreviousHash}");
+                          
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        UpdateMessages($"Error deserializing chain: {ex.Message}");
+                    }
                 }
-                catch (ObjectDisposedException)
+                else
                 {
-                    UpdateMessages("Odjemalec se je odklopil");
-                }
-                catch (Exception e)
-                {
-                    UpdateMessages($"NAPAKA na odjemalcu! ...{e.Message}");
-                    break;
+                    UpdateMessages($"Received: {msg}");
                 }
             }
 
@@ -177,7 +187,7 @@ namespace Blockchain_vaja
 
 
             threadServer(); 
-            threadClient();
+            //threadClient();
         }
 
         private async void mineButton_Click(object sender, EventArgs e)
@@ -187,42 +197,77 @@ namespace Blockchain_vaja
 
         }
 
+        private void DisplayValidBlock(Block block)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action<Block>(DisplayValidBlock), block);
+                return;
+            }
+
+            miningBox.AppendText(
+                $"Index: {block.Index}\r\n" +
+                $"Difficulty: {block.Difficulty}\r\n" +
+                $"Nonce: {block.Nonce}\r\n" +
+                $"Hash: {block.Hash}\r\n" +
+                $"PrevHash: {block.PreviousHash}\r\n" +
+                $"Timestamp: {block.Timestamp:O}\r\n" +
+                "-----------------------------\r\n"
+            );
+        }
+
         private async Task Mining(CancellationToken token)
         {
-            while (is_mining)
+            while (is_mining && !token.IsCancellationRequested)
             {
-                Block newBlock;
-                int diff = blockchain.GetLatestBlock().Difficulty; //trenutna težavnost zadnjega bloka
-                blockchain.AdjustDifficulty(ref diff); //prilagoditev težavnosti
-                if (diff == blockchain.GetLatestBlock().Difficulty)
+                // 1) pod lock preberi stabilen "latest" + izračunaj difficulty
+                Block latest;
+                int diff;
+
+                lock (chainLock)
                 {
-                    //ustvari nov blok
-                    newBlock = new Block(blockchain.GetLatestBlock().Index + 1, "Block data", DateTime.Now, blockchain.GetLatestBlock().Hash, blockchain.GetLatestBlock().Difficulty);
-                    //previousHash poveže blok nazaj na prejšnjega
-                    //timeStamp za pravila časa, prilagajanje težavnosti
-                    //Difficulty... koliko dela mora rudar opraviti
+                    latest = blockchain.GetLatestBlock();
+                    diff = latest.Difficulty;
+                    blockchain.AdjustDifficulty(ref diff);
+                }
+
+                // 2) rudarjenje (brez locka) – to je najdražje in bi blokiralo druge niti
+                var newBlock = new Block(
+                    latest.Index + 1,
+                    "Block data",
+                    DateTime.UtcNow,
+                    latest.Hash,
+                    diff
+                );
+
+                // 3) poskusi dodati blok pod lock (da se veriga vmes ni zamenjala)
+                bool added = false;
+                lock (chainLock)
+                {
+                    // če se je vmes veriga zamenjala, latest ni več aktualen → ne dodajaj
+                    var currentLatest = blockchain.GetLatestBlock();
+                    if (currentLatest.Hash == newBlock.PreviousHash &&
+                        currentLatest.Index + 1 == newBlock.Index)
+                    {
+                        blockchain.AddBlock(newBlock);
+                        added = true;
+                    }
+                }
+
+                if (added)
+                {
+                    DisplayValidBlock(newBlock);
+                    await SendChainToPeers();
+                    UpdateMessages($"Block mined and sent: {newBlock.Index}");
                 }
                 else
                 {
-                    newBlock = new Block(blockchain.GetLatestBlock().Index + 1, "Block data", DateTime.Now, blockchain.GetLatestBlock().Hash, diff);
-                   
+                    // veriga se je vmes spremenila (npr. ReplaceChain), zato ta blok zavržemo
+                    UpdateMessages("Mined block discarded (chain updated during mining).");
                 }
 
-                //dodaj blok v verigo
-                blockchain.AddBlock(newBlock);
-
-
-                //pošlje prvo celo verigo za prevzem
-                await SendChainToPeers();
-
-                //pošlji blok vsem peerjem
-                //await SendBlockToPeers(newBlock);
-
-                UpdateMessages($"Block mined and sent: {newBlock.Index}");
-
-                await Task.Delay(4000);
+                await Task.Delay(4000, token);
             }
-
         }
 
         private void Port_TextChanged(object sender, EventArgs e)
@@ -270,21 +315,15 @@ namespace Blockchain_vaja
             }
         }
 
-        /*private async Task SendBlockToPeers(Block block)//SEND funkcija
+        private async Task SendChainToPeers()
         {
-            string json = block.SerializeBlock();
-            foreach (var peer in peers)//posljem vsem peerom
+            string json_chain;
+            lock (chainLock)
             {
-                NetworkStream stream = peer.GetStream();
-                byte[] buffer = Encoding.UTF8.GetBytes(json);
-                await stream.WriteAsync(buffer, 0, buffer.Length);
+                json_chain = JsonSerializer.Serialize(blockchain.GetChain()) + "\n";
             }
-        }*/
 
-        private async Task SendChainToPeers()//SEND funkcija
-        {
-            string json_chain = JsonSerializer.Serialize(blockchain.GetChain());
-            foreach (var peer in peers)//posljem vsem peerom
+            foreach (var peer in peers)
             {
                 NetworkStream stream = peer.GetStream();
                 byte[] buffer = Encoding.UTF8.GetBytes(json_chain);
@@ -301,18 +340,6 @@ namespace Blockchain_vaja
             else
             {
                 blockchainLedger.AppendText(message + Environment.NewLine);
-            }
-        }
-
-        private void UpdateHashes(string msg)
-        {
-            if (InvokeRequired)
-            {
-                Invoke(new Action<string>(UpdateMessages), msg);
-            }
-            else
-            {
-                miningBox.AppendText(msg + Environment.NewLine);
             }
         }
 
@@ -361,36 +388,42 @@ namespace Blockchain_vaja
         public int Difficulty { get; set; } //koliko ničel mora imeti hash na začetku (PoW - dokaz dela)
         public int Nonce { get; set; } //število, ki ga spreminjam pri iskanju hash-a 
 
-        public Block(int index, string data, DateTime timestamp, string previousHash, int difficulty)
+        public Block() { }
+
+        public Block(int index, string data, DateTime timestampUtc, string previousHash, int difficulty)
         {
             Index = index;
             Data = data;
-            Timestamp = timestamp;
+            Timestamp = timestampUtc;
             PreviousHash = previousHash;
             Difficulty = difficulty;
             Nonce = 0;
-            Hash = CalculateHash();
+            Hash = Mine();
         }
 
-        public string CalculateHash() // to je dejansko MINING
+        public string ComputeHash(int nonce) // to je dejansko MINING
         {
-            using (var sha256 = SHA256.Create())
+            using var sha256 = SHA256.Create();
+
+            string input = $"{Index}{Data}{Timestamp:O}{PreviousHash}{Difficulty}{nonce}";
+            byte[] bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(input));
+            return Convert.ToHexString(bytes);
+        }
+
+        public string Mine()
+        {
+            string target = new string('0', Difficulty);
+            int nonce = 0;
+
+            while (true)
             {
-                var target = new string('0', Difficulty); //hash mora imeti toliko nul pred njim kot je tezavnost
-                //težavnost določa kako težko je najti hash z dovolj ničlami
-                string hash;
-                Nonce = 0;
-
-                do
+                string hash = ComputeHash(nonce);
+                if (hash.StartsWith(target))
                 {
-                    var input = $"{Index}{Timestamp}{Data}{PreviousHash}{Nonce}";
-                    var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(input));
-                    hash = BitConverter.ToString(bytes).Replace("-", string.Empty);
-
-                    Nonce++;
-                } while (!hash.StartsWith(target));
-
-                return hash;
+                    Nonce = nonce;
+                    return hash;
+                }
+                nonce++;
             }
         }
     }
@@ -403,7 +436,7 @@ namespace Blockchain_vaja
         private int difficultyAdjustmentInterval;
         private DateTime lastDifficultyAdjustment;
 
-        public Blockchain(int difficulty = 3, int blockGenerationInterval = 10, int difficultyAdjustmentInterval = 10)
+        public Blockchain(int difficulty = 5, int blockGenerationInterval = 10, int difficultyAdjustmentInterval = 10)
         {
             this.difficulty = difficulty;
             this.blockGenerationInterval = blockGenerationInterval;
@@ -413,15 +446,13 @@ namespace Blockchain_vaja
             {
                 CreateGenesisBlock()
             };
-            lastDifficultyAdjustment = DateTime.Now;
+            lastDifficultyAdjustment = DateTime.UtcNow;
         }
 
         private Block CreateGenesisBlock()
         {
-            return new Block(0, "Genesis Block", DateTime.Now, "0", difficulty);
+            return new Block(0, "Genesis Block", DateTime.UnixEpoch, "0", difficulty);
             //genesis blok je prvi blok, začetek blockchain-a
-            //v realnih sistemih je genesis isti za vse, pri meni ima DateTime.Now, zato bo različen... verige se lahko med sabo ne bodo ujemale!!
-            // ^^ta razlika je velika konceptualna razlika od pravega blockchain
         }
 
         public Block GetLatestBlock()
@@ -453,38 +484,23 @@ namespace Blockchain_vaja
 
         public bool ValidateChain(List<Block> chainToValidate) //VARNOSTNA PRAVILA
         {
-            for (int i = 1; i < chainToValidate.Count; i++)
+            for(int i = 1; i < chainToValidate.Count; i++)
             {
-                Block currentBlock = chainToValidate[i];
-                Block previousBlock = chainToValidate[i - 1];
+                Block current = chainToValidate[i];
+                Block previous = chainToValidate[i - 1];
 
-                // Preverimo osnovne pogoje
-                if (currentBlock.Index != previousBlock.Index + 1) //prepreči preskoke/duplikate
-                {
-                    return false;
-                }
-                if (currentBlock.PreviousHash != previousBlock.Hash) //zagotovi povezavo med bloki
-                {
-                    return false;
-                }
-                if (currentBlock.Hash != currentBlock.CalculateHash()) //hash mora ustrezat podatkom
-                {
-                    Debug.WriteLine("hash");
-                    return false;
-                }
-                if (currentBlock.Timestamp > DateTime.Now.AddMinutes(1)) //blok ne sme biti iz prihodnosti
-                {
-                    return false;
-                }
+                if (current.Index != previous.Index + 1) return false;
+                if (current.PreviousHash != previous.Hash) return false;
 
-                if (currentBlock.Timestamp<previousBlock.Timestamp||
-                    currentBlock.Timestamp> previousBlock.Timestamp.AddMinutes(5))
-                {
-                return false;
-                }
+                if (current.Timestamp > DateTime.UtcNow.AddMinutes(1)) return false;
+                if (current.Timestamp < previous.Timestamp.AddMinutes(-1)) return false;
 
+                //Proof of work
+                if (!current.Hash.StartsWith(new string('0', current.Difficulty))) return false;
+
+                string recomputed = current.ComputeHash(current.Nonce);
+                if(current.Hash !=  recomputed) return false;
             }
-        
             return true;
         }
 
@@ -518,30 +534,28 @@ namespace Blockchain_vaja
 
         public void AdjustDifficulty(ref int diff)
         {
-            if (chain.Count % 10 == 0 && chain.Count > 0) //vsakih 10 blokov ocenjujem hitrost rudarjenja
-            {
-                int latestBlockIndex = chain.Last().Index;
+            if (chain.Count <= difficultyAdjustmentInterval) return;
 
-                // Pridobi blok, ki je bil uporabljen za zadnjo prilagoditev težavnosti
-                Block previousAdjustmentBlock = chain[chain.Count - difficultyAdjustmentInterval];
+            int minedBlocksNum = chain.Count - 1;
 
-                // Izračunajte pričakovani čas generiranja blokov
-                TimeSpan expectedTime = TimeSpan.FromSeconds(blockGenerationInterval * difficultyAdjustmentInterval);
+            if (minedBlocksNum % difficultyAdjustmentInterval != 0) return;
 
-                // Izračunajte dejanski čas, ki je minil od zadnje prilagoditve težavnosti
-                TimeSpan timeTaken = chain.Last().Timestamp - previousAdjustmentBlock.Timestamp;
+            //prilagoditveni blok = veriga[dolžina - interval - 1] ...blok uporabljen za prilagoditev tezavnosti
+            //(blok tik pred zadnjimi N bloki)
+            Block adjustmentBlock = chain[chain.Count - difficultyAdjustmentInterval - 1];
+            Block latestBlock = chain.Last();
+            TimeSpan expectedTime = TimeSpan.FromSeconds(blockGenerationInterval * difficultyAdjustmentInterval);
+            TimeSpan timeTaken = latestBlock.Timestamp - adjustmentBlock.Timestamp;
+            int baseDifficulty = adjustmentBlock.Difficulty;
 
-                //prilagoditev tezavnosti
-                if (timeTaken < expectedTime / 2) //prehitro generiranje
-                {
-                    diff=chain.Last().Difficulty + 1;
-                }
-                else if (timeTaken > expectedTime * 2) //prepočasno generiranje
-                {
-                    diff=chain.Last().Difficulty - 1;
-                }
-            }
+            if (timeTaken < expectedTime / 2)          // prehitro
+                diff = baseDifficulty + 1;
+            else if (timeTaken > expectedTime * 2)     // prepočasi
+                diff = Math.Max(1, baseDifficulty - 1);
+            else
+                diff = baseDifficulty;
 
         }
+
     }
 }
